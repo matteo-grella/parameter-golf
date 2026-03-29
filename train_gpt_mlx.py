@@ -52,6 +52,8 @@ class Hyperparameters:
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
     # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_max_batches: int = int(os.environ.get("VAL_MAX_BATCHES", 0))
+    skip_final_val: bool = bool(int(os.environ.get("SKIP_FINAL_VAL", "0")))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
@@ -80,8 +82,9 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    use_mhc_lite: bool = bool(int(os.environ.get("USE_MHC_LITE", "1")))
-    mhc_init_strength: float = float(os.environ.get("MHC_INIT_STRENGTH", 6.0))
+    current_token_aux_weight: float = float(os.environ.get("CURRENT_TOKEN_AUX_WEIGHT", 0.10))
+    current_token_aux_layer: int = int(os.environ.get("CURRENT_TOKEN_AUX_LAYER", 1))
+    current_token_aux_decay_iters: int = int(os.environ.get("CURRENT_TOKEN_AUX_DECAY_ITERS", 0))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -121,13 +124,18 @@ class Hyperparameters:
         remaining_ms = max(1000.0 * self.max_wallclock_seconds - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
+    def current_token_aux_scale(self, step: int) -> float:
+        if self.current_token_aux_weight <= 0.0:
+            return 0.0
+        decay_iters = self.current_token_aux_decay_iters if self.current_token_aux_decay_iters > 0 else self.iterations
+        return max(1.0 - step / max(decay_iters, 1), 0.0)
+
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,"
-        "mhc_mix_logit,mhc_read_logits,mhc_write_logits,final_stream_logits",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -174,35 +182,6 @@ def accumulate_flat_grads(
 
 def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)).astype(x.dtype)
-
-
-def sigmoid01(x: mx.array) -> mx.array:
-    x_f32 = x.astype(mx.float32)
-    return (1.0 / (1.0 + mx.exp(-x_f32))).astype(x.dtype)
-
-
-def simplex_pair(logits: mx.array) -> mx.array:
-    # Stable 2-way simplex projection without depending on a framework softmax helper.
-    delta = (logits[0] - logits[1]).astype(mx.float32)
-    w0 = 1.0 / (1.0 + mx.exp(-delta))
-    w1 = 1.0 - w0
-    return mx.stack((w0, w1), axis=0).astype(logits.dtype)
-
-
-def mix_two_streams(x_main: mx.array, x_aux: mx.array, mix_logit: mx.array) -> tuple[mx.array, mx.array]:
-    # For two streams, every doubly stochastic 2x2 matrix is determined by a single alpha in [0, 1]:
-    # [[alpha, 1-alpha], [1-alpha, alpha]]. This preserves identity-like signal flow while still
-    # letting the model exchange information between the streams.
-    alpha = sigmoid01(mix_logit).astype(x_main.dtype)[None, None, :]
-    beta = 1.0 - alpha
-    mixed_main = alpha * x_main + beta * x_aux
-    mixed_aux = beta * x_main + alpha * x_aux
-    return mixed_main, mixed_aux
-
-
-def combine_two_streams(x_main: mx.array, x_aux: mx.array, logits: mx.array) -> mx.array:
-    weights = simplex_pair(logits).astype(x_main.dtype)
-    return weights[0][None, None, :] * x_main + weights[1][None, None, :] * x_aux
 
 
 def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.array:
@@ -392,11 +371,8 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        use_mhc_lite: bool,
-        mhc_init_strength: float,
     ):
         super().__init__()
-        self.use_mhc_lite = use_mhc_lite
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
@@ -404,61 +380,29 @@ class Block(nn.Module):
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
-        if use_mhc_lite:
-            neg_strength = -mhc_init_strength
-            self.mhc_mix_logit = mx.ones((dim,), dtype=mx.float32) * mhc_init_strength
-            self.mhc_read_logits = mx.array(
-                np.stack(
-                    (
-                        np.full((dim,), mhc_init_strength, dtype=np.float32),
-                        np.full((dim,), neg_strength, dtype=np.float32),
-                    )
-                )
-            )
-            self.mhc_write_logits = mx.array(
-                np.stack(
-                    (
-                        np.full((dim,), mhc_init_strength, dtype=np.float32),
-                        np.full((dim,), neg_strength, dtype=np.float32),
-                    )
-                )
-            )
 
-    def __call__(self, x_main: mx.array, x_aux: mx.array, x0: mx.array) -> tuple[mx.array, mx.array]:
-        if self.use_mhc_lite:
-            mixed_main, mixed_aux = mix_two_streams(x_main, x_aux, self.mhc_mix_logit)
-            x = combine_two_streams(mixed_main, mixed_aux, self.mhc_read_logits)
-        else:
-            mixed_main, mixed_aux = x_main, x_aux
-            x = x_main
+    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         delta = self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
         delta = delta + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x + delta))
-        if not self.use_mhc_lite:
-            return mixed_main + delta, mixed_aux
-        write_weights = simplex_pair(self.mhc_write_logits).astype(x.dtype)
-        next_main = mixed_main + write_weights[0][None, None, :] * delta
-        next_aux = mixed_aux + write_weights[1][None, None, :] * delta
-        return next_main, next_aux
+        return x + delta
 
 
 class GPT(nn.Module):
     # - token embedding + RMSNorm
     # - encoder half accumulates skip tensors
     # - decoder half consumes reversed skips with learned skip_weights
-    # - optional mHC-lite keeps a second residual stream with constrained cross-stream mixing
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float, use_mhc_lite: bool, mhc_init_strength: float):
+                 qk_gain_init: float):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
-        self.use_mhc_lite = use_mhc_lite
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_encoder_layers = num_layers // 2
@@ -466,19 +410,10 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, use_mhc_lite, mhc_init_strength)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
-        if use_mhc_lite:
-            self.final_stream_logits = mx.array(
-                np.stack(
-                    (
-                        np.full((dim,), mhc_init_strength, dtype=np.float32),
-                        np.full((dim,), -mhc_init_strength, dtype=np.float32),
-                    )
-                )
-            )
 
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
@@ -491,14 +426,20 @@ class GPT(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
-    def __call__(self, input_ids: mx.array) -> mx.array:
+    def forward_hidden(self, input_ids: mx.array, aux_layer: int | None = None) -> tuple[mx.array, mx.array | None]:
+        if aux_layer is not None and not (1 <= aux_layer <= len(self.blocks)):
+            raise ValueError(f"current_token_aux_layer must be in [1, {len(self.blocks)}], got {aux_layer}")
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
-        x_aux = x
         skips: list[mx.array] = []
+        aux_hidden: mx.array | None = None
+        layer_idx = 0
 
         for i in range(self.num_encoder_layers):
-            x, x_aux = self.blocks[i](x, x_aux, x0)
+            x = self.blocks[i](x, x0)
+            layer_idx += 1
+            if aux_layer == layer_idx:
+                aux_hidden = x
             skips.append(x)
         for i in range(self.num_decoder_layers):
             # Odd layer counts have one more decoder block than encoder block. The baseline only
@@ -506,15 +447,18 @@ class GPT(nn.Module):
             # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x, x_aux = self.blocks[self.num_encoder_layers + i](x, x_aux, x0)
-        if self.use_mhc_lite:
-            x = combine_two_streams(x, x_aux, self.final_stream_logits)
-        return self.final_norm(x)
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            layer_idx += 1
+            if aux_layer == layer_idx:
+                aux_hidden = x
+        return self.final_norm(x), aux_hidden
 
-    def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
-        # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
-        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+    def __call__(self, input_ids: mx.array) -> mx.array:
+        x, _ = self.forward_hidden(input_ids, aux_layer=None)
+        return x
+
+    def next_token_loss(self, hidden: mx.array, target_ids: mx.array) -> mx.array:
+        x = hidden.reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
             logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
@@ -529,6 +473,32 @@ class GPT(nn.Module):
             logits = self.softcap(logits_proj)
             loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
         return loss_sum / float(n)
+
+    def current_token_aux_loss(self, hidden: mx.array, input_ids: mx.array) -> mx.array:
+        x = hidden.reshape(-1, self.tok_emb.weight.shape[1])
+        labels = input_ids.reshape(-1)
+        logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
+        logits = self.softcap(logits_proj)
+        return nn.losses.cross_entropy(logits.astype(mx.float32), labels, reduction="mean")
+
+    def loss(
+        self,
+        input_ids: mx.array,
+        target_ids: mx.array,
+        current_token_aux_weight: mx.array | None = None,
+        current_token_aux_layer: int | None = None,
+    ) -> mx.array:
+        hidden, aux_hidden = self.forward_hidden(
+            input_ids,
+            aux_layer=current_token_aux_layer if current_token_aux_weight is not None else None,
+        )
+        loss = self.next_token_loss(hidden, target_ids)
+        if current_token_aux_weight is not None:
+            if aux_hidden is None:
+                raise ValueError("aux hidden state was not captured for current-token auxiliary loss")
+            aux_loss = self.current_token_aux_loss(aux_hidden, input_ids)
+            loss = loss + current_token_aux_weight.astype(mx.float32) * aux_loss
+        return loss
 
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
@@ -564,7 +534,7 @@ class Muon:
 class SplitOptimizers:
     # - embeddings: Adam with the tied-embedding LR
     # - block matrices (2D): Muon
-    # - block scalars + top-level control tensors: Adam
+    # - block scalars + skip weights: Adam
     # This preserves the high-level optimization behavior even though MLX internals differ.
     def __init__(self, model: GPT, args: Hyperparameters):
         self.args = args
@@ -825,14 +795,19 @@ def loss_and_grad_chunked(
     args: Hyperparameters,
     train_loader: TokenLoader,
     compiled_loss_and_grad,
+    aux_weight: float | None = None,
 ) -> tuple[mx.array, dict]:
     chunk_sizes = token_chunks(args.microbatch_tokens, args.train_seq_len, args.mlx_max_microbatch_tokens)
     total_tokens = float(sum(chunk_sizes))
     loss_value = mx.array(0.0, dtype=mx.float32)
     grad_accum: dict[str, mx.array] | None = None
+    aux_weight_arr = mx.array(aux_weight, dtype=mx.float32) if aux_weight is not None else None
     for chunk_tokens in chunk_sizes:
         x, y = train_loader.next_batch(chunk_tokens, args.train_seq_len)
-        loss, grads = compiled_loss_and_grad(x, y)
+        if aux_weight_arr is None:
+            loss, grads = compiled_loss_and_grad(x, y)
+        else:
+            loss, grads = compiled_loss_and_grad(x, y, aux_weight_arr)
         scale = float(y.size) / total_tokens
         loss_value = loss_value + loss.astype(mx.float32) * scale
         grad_accum = accumulate_flat_grads(grad_accum, grads, scale)
@@ -863,10 +838,14 @@ def eval_val(
     val_batch_seqs = val_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.size - 1) // args.train_seq_len
     total_batches = max((total_seqs + val_batch_seqs - 1) // val_batch_seqs, 1)
+    if args.val_max_batches > 0:
+        total_batches = min(total_batches, args.val_max_batches)
     total_loss_sum = 0.0
     total_tokens = 0.0
     total_bytes = 0.0
     for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
+        if batch_idx > total_batches:
+            break
         batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
         raw_start = batch_seq_start * args.train_seq_len
         raw_end = batch_seq_end * args.train_seq_len + 1
@@ -953,6 +932,10 @@ def main() -> None:
         args.tokenizer_path,
     )
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    if args.current_token_aux_weight > 0.0 and not (1 <= args.current_token_aux_layer <= args.num_layers):
+        raise ValueError(
+            f"CURRENT_TOKEN_AUX_LAYER must be in [1, {args.num_layers}], got {args.current_token_aux_layer}"
+        )
 
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size
@@ -980,8 +963,6 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
-        use_mhc_lite=args.use_mhc_lite,
-        mhc_init_strength=args.mhc_init_strength,
     )
     opt = SplitOptimizers(model, args)
 
@@ -993,11 +974,26 @@ def main() -> None:
     # Compiling the model-bound functions and capturing the full model state fixes that while still
     # returning gradients only for trainable parameters via nn.value_and_grad(...).
     compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
-    compiled_loss_and_grad = mx.compile(
-        nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
-        inputs=model.state,
-        outputs=model.state,
-    )
+    if args.current_token_aux_weight > 0.0:
+        compiled_loss_and_grad = mx.compile(
+            nn.value_and_grad(
+                model,
+                lambda x, y, aux_w: model.loss(
+                    x,
+                    y,
+                    current_token_aux_weight=aux_w,
+                    current_token_aux_layer=args.current_token_aux_layer,
+                ),
+            ),
+            inputs=model.state,
+            outputs=model.state,
+        )
+    else:
+        compiled_loss_and_grad = mx.compile(
+            nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
+            inputs=model.state,
+            outputs=model.state,
+        )
 
     # Print config once so logs are self-describing.
     n_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
@@ -1019,8 +1015,7 @@ def main() -> None:
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
-        f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings} "
-        f"use_mhc_lite:{args.use_mhc_lite}"
+        f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
@@ -1035,6 +1030,14 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
         f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
     )
+    if args.current_token_aux_weight > 0.0:
+        decay_iters = args.current_token_aux_decay_iters if args.current_token_aux_decay_iters > 0 else args.iterations
+        log(
+            f"current_token_aux:enabled weight:{args.current_token_aux_weight} "
+            f"layer:{args.current_token_aux_layer} decay_iters:{decay_iters}"
+        )
+    else:
+        log("current_token_aux:disabled")
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
@@ -1055,8 +1058,14 @@ def main() -> None:
             accum: dict[str, mx.array] | None = None
             warmup_loss = mx.array(0.0, dtype=mx.float32)
             grad_scale = 1.0 / args.grad_accum_steps
+            warmup_aux_weight = args.current_token_aux_weight * args.current_token_aux_scale(0)
             for _ in range(args.grad_accum_steps):
-                warmup_loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+                warmup_loss, grads = loss_and_grad_chunked(
+                    args,
+                    train_loader,
+                    compiled_loss_and_grad,
+                    aux_weight=warmup_aux_weight if args.current_token_aux_weight > 0.0 else None,
+                )
                 accum = accumulate_flat_grads(accum, grads, grad_scale)
             mx.eval(warmup_loss, accum)
             mx.synchronize()
@@ -1088,7 +1097,9 @@ def main() -> None:
     step = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        should_eval = args.val_loss_every > 0 and step % args.val_loss_every == 0
+        should_final_eval = last_step and not args.skip_final_val
+        if should_final_eval or should_eval:
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
             # Validation always scans the same fixed full validation split.
             val_loss, val_bpb = eval_val(
@@ -1117,8 +1128,14 @@ def main() -> None:
         accum: dict[str, mx.array] | None = None
         train_loss = mx.array(0.0, dtype=mx.float32)
         grad_scale = 1.0 / args.grad_accum_steps
+        aux_weight = args.current_token_aux_weight * args.current_token_aux_scale(step)
         for _ in range(args.grad_accum_steps):
-            loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+            loss, grads = loss_and_grad_chunked(
+                args,
+                train_loader,
+                compiled_loss_and_grad,
+                aux_weight=aux_weight if args.current_token_aux_weight > 0.0 else None,
+            )
             accum = accumulate_flat_grads(accum, grads, grad_scale)
             train_loss = train_loss + loss.astype(mx.float32) * grad_scale
             if args.mlx_eager_eval:
@@ -1166,6 +1183,9 @@ def main() -> None:
         f"serialized_model_int8_zlib:{quant_file_bytes} bytes "
         f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
     )
+    if args.skip_final_val:
+        log("final_int8_zlib_roundtrip skipped")
+        return
 
     with quant_path.open("rb") as f:
         quant_blob_disk = f.read()
