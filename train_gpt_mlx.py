@@ -80,6 +80,8 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    use_mhc_lite: bool = bool(int(os.environ.get("USE_MHC_LITE", "1")))
+    mhc_init_strength: float = float(os.environ.get("MHC_INIT_STRENGTH", 6.0))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -124,7 +126,8 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,"
+        "mhc_mix_logit,mhc_read_logits,mhc_write_logits,final_stream_logits",
     ).split(",")
     if pattern
 )
@@ -171,6 +174,35 @@ def accumulate_flat_grads(
 
 def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)).astype(x.dtype)
+
+
+def sigmoid01(x: mx.array) -> mx.array:
+    x_f32 = x.astype(mx.float32)
+    return (1.0 / (1.0 + mx.exp(-x_f32))).astype(x.dtype)
+
+
+def simplex_pair(logits: mx.array) -> mx.array:
+    # Stable 2-way simplex projection without depending on a framework softmax helper.
+    delta = (logits[0] - logits[1]).astype(mx.float32)
+    w0 = 1.0 / (1.0 + mx.exp(-delta))
+    w1 = 1.0 - w0
+    return mx.stack((w0, w1), axis=0).astype(logits.dtype)
+
+
+def mix_two_streams(x_main: mx.array, x_aux: mx.array, mix_logit: mx.array) -> tuple[mx.array, mx.array]:
+    # For two streams, every doubly stochastic 2x2 matrix is determined by a single alpha in [0, 1]:
+    # [[alpha, 1-alpha], [1-alpha, alpha]]. This preserves identity-like signal flow while still
+    # letting the model exchange information between the streams.
+    alpha = sigmoid01(mix_logit).astype(x_main.dtype)[None, None, :]
+    beta = 1.0 - alpha
+    mixed_main = alpha * x_main + beta * x_aux
+    mixed_aux = beta * x_main + alpha * x_aux
+    return mixed_main, mixed_aux
+
+
+def combine_two_streams(x_main: mx.array, x_aux: mx.array, logits: mx.array) -> mx.array:
+    weights = simplex_pair(logits).astype(x_main.dtype)
+    return weights[0][None, None, :] * x_main + weights[1][None, None, :] * x_aux
 
 
 def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.array:
@@ -360,8 +392,11 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_mhc_lite: bool,
+        mhc_init_strength: float,
     ):
         super().__init__()
+        self.use_mhc_lite = use_mhc_lite
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
@@ -369,29 +404,61 @@ class Block(nn.Module):
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
+        if use_mhc_lite:
+            neg_strength = -mhc_init_strength
+            self.mhc_mix_logit = mx.ones((dim,), dtype=mx.float32) * mhc_init_strength
+            self.mhc_read_logits = mx.array(
+                np.stack(
+                    (
+                        np.full((dim,), mhc_init_strength, dtype=np.float32),
+                        np.full((dim,), neg_strength, dtype=np.float32),
+                    )
+                )
+            )
+            self.mhc_write_logits = mx.array(
+                np.stack(
+                    (
+                        np.full((dim,), mhc_init_strength, dtype=np.float32),
+                        np.full((dim,), neg_strength, dtype=np.float32),
+                    )
+                )
+            )
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
+    def __call__(self, x_main: mx.array, x_aux: mx.array, x0: mx.array) -> tuple[mx.array, mx.array]:
+        if self.use_mhc_lite:
+            mixed_main, mixed_aux = mix_two_streams(x_main, x_aux, self.mhc_mix_logit)
+            x = combine_two_streams(mixed_main, mixed_aux, self.mhc_read_logits)
+        else:
+            mixed_main, mixed_aux = x_main, x_aux
+            x = x_main
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
+        delta = self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
+        delta = delta + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x + delta))
+        if not self.use_mhc_lite:
+            return mixed_main + delta, mixed_aux
+        write_weights = simplex_pair(self.mhc_write_logits).astype(x.dtype)
+        next_main = mixed_main + write_weights[0][None, None, :] * delta
+        next_aux = mixed_aux + write_weights[1][None, None, :] * delta
+        return next_main, next_aux
 
 
 class GPT(nn.Module):
     # - token embedding + RMSNorm
     # - encoder half accumulates skip tensors
     # - decoder half consumes reversed skips with learned skip_weights
+    # - optional mHC-lite keeps a second residual stream with constrained cross-stream mixing
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, use_mhc_lite: bool, mhc_init_strength: float):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.use_mhc_lite = use_mhc_lite
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_encoder_layers = num_layers // 2
@@ -399,10 +466,19 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, use_mhc_lite, mhc_init_strength)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
+        if use_mhc_lite:
+            self.final_stream_logits = mx.array(
+                np.stack(
+                    (
+                        np.full((dim,), mhc_init_strength, dtype=np.float32),
+                        np.full((dim,), -mhc_init_strength, dtype=np.float32),
+                    )
+                )
+            )
 
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
@@ -418,10 +494,11 @@ class GPT(nn.Module):
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
+        x_aux = x
         skips: list[mx.array] = []
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x, x_aux = self.blocks[i](x, x_aux, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             # Odd layer counts have one more decoder block than encoder block. The baseline only
@@ -429,7 +506,9 @@ class GPT(nn.Module):
             # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x, x_aux = self.blocks[self.num_encoder_layers + i](x, x_aux, x0)
+        if self.use_mhc_lite:
+            x = combine_two_streams(x, x_aux, self.final_stream_logits)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -485,7 +564,7 @@ class Muon:
 class SplitOptimizers:
     # - embeddings: Adam with the tied-embedding LR
     # - block matrices (2D): Muon
-    # - block scalars + skip weights: Adam
+    # - block scalars + top-level control tensors: Adam
     # This preserves the high-level optimization behavior even though MLX internals differ.
     def __init__(self, model: GPT, args: Hyperparameters):
         self.args = args
@@ -499,7 +578,11 @@ class SplitOptimizers:
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if k != self.embed_key and (
+                k == "skip_weights"
+                or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+                or (k.startswith("blocks.") and p.ndim < 2)
+            )
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -897,6 +980,8 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        use_mhc_lite=args.use_mhc_lite,
+        mhc_init_strength=args.mhc_init_strength,
     )
     opt = SplitOptimizers(model, args)
 
@@ -934,7 +1019,8 @@ def main() -> None:
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
-        f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
+        f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings} "
+        f"use_mhc_lite:{args.use_mhc_lite}"
     )
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
