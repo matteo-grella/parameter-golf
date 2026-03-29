@@ -82,6 +82,8 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    use_token_shift: bool = bool(int(os.environ.get("USE_TOKEN_SHIFT", "1")))
+    token_shift_init: float = float(os.environ.get("TOKEN_SHIFT_INIT", 1.386294))
     current_token_aux_weight: float = float(os.environ.get("CURRENT_TOKEN_AUX_WEIGHT", 0.10))
     current_token_aux_layer: int = int(os.environ.get("CURRENT_TOKEN_AUX_LAYER", 1))
     current_token_aux_decay_iters: int = int(os.environ.get("CURRENT_TOKEN_AUX_DECAY_ITERS", 0))
@@ -135,7 +137,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,token_shift_mix_k,token_shift_mix_v,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -182,6 +184,16 @@ def accumulate_flat_grads(
 
 def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)).astype(x.dtype)
+
+
+def sigmoid01(x: mx.array) -> mx.array:
+    x_f32 = x.astype(mx.float32)
+    return (1.0 / (1.0 + mx.exp(-x_f32))).astype(x.dtype)
+
+
+def shift_right(x: mx.array) -> mx.array:
+    pad = mx.zeros((x.shape[0], 1, x.shape[2]), dtype=x.dtype)
+    return mx.concatenate((pad, x[:, :-1, :]), axis=1)
 
 
 def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.array:
@@ -305,6 +317,7 @@ class RMSNormNoWeight(nn.Module):
 
 class CausalSelfAttention(nn.Module):
     # - separate q/k/v projections
+    # - optional K/V token shift to cheaply inject previous-token context before attention
     # - RMSNorm on q and k before attention
     # - RoPE on q and k
     # - causal masked SDPA
@@ -315,6 +328,8 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        use_token_shift: bool,
+        token_shift_init: float,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -332,14 +347,27 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(dim, kv_dim)
         self.proj = CastedLinear(dim, dim)
         self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
+        self.use_token_shift = use_token_shift
+        if use_token_shift:
+            self.token_shift_mix_k = mx.ones((dim,), dtype=mx.float32) * token_shift_init
+            self.token_shift_mix_v = mx.ones((dim,), dtype=mx.float32) * token_shift_init
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
 
     def __call__(self, x: mx.array) -> mx.array:
         bsz, seqlen, dim = x.shape
+        if self.use_token_shift:
+            xx = shift_right(x)
+            mix_k = sigmoid01(self.token_shift_mix_k).astype(x.dtype)[None, None, :]
+            mix_v = sigmoid01(self.token_shift_mix_v).astype(x.dtype)[None, None, :]
+            xk = x * mix_k + xx * (1.0 - mix_k)
+            xv = x * mix_v + xx * (1.0 - mix_v)
+        else:
+            xk = x
+            xv = x
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.c_k(xk).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.c_v(xv).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
         k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
@@ -371,11 +399,13 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_token_shift: bool,
+        token_shift_init: float,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, use_token_shift, token_shift_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
@@ -394,10 +424,11 @@ class GPT(nn.Module):
     # - token embedding + RMSNorm
     # - encoder half accumulates skip tensors
     # - decoder half consumes reversed skips with learned skip_weights
+    # - optional K/V token shift inside attention for cheap previous-token mixing
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, use_token_shift: bool, token_shift_init: float):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -410,7 +441,7 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, use_token_shift, token_shift_init)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -963,6 +994,8 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        use_token_shift=args.use_token_shift,
+        token_shift_init=args.token_shift_init,
     )
     opt = SplitOptimizers(model, args)
 
@@ -1017,6 +1050,7 @@ def main() -> None:
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
+    log(f"token_shift:enabled={args.use_token_shift} init={args.token_shift_init}")
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "

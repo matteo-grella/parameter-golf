@@ -30,6 +30,8 @@ def load_model(checkpoint: Path, args: Hyperparameters) -> GPT:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        use_token_shift=args.use_token_shift,
+        token_shift_init=args.token_shift_init,
     )
     flat_state = {name: numpy_to_mx(value) for name, value in np.load(checkpoint).items()}
     model.update(tree_unflatten(list(flat_state.items())))
