@@ -84,6 +84,8 @@ class Hyperparameters:
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
     use_token_shift: bool = bool(int(os.environ.get("USE_TOKEN_SHIFT", "1")))
     token_shift_init: float = float(os.environ.get("TOKEN_SHIFT_INIT", 1.386294))
+    use_channel_mix: bool = bool(int(os.environ.get("USE_CHANNEL_MIX", "1")))
+    channel_mix_shift_init: float = float(os.environ.get("CHANNEL_MIX_SHIFT_INIT", 0.0))
     current_token_aux_weight: float = float(os.environ.get("CURRENT_TOKEN_AUX_WEIGHT", 0.10))
     current_token_aux_layer: int = int(os.environ.get("CURRENT_TOKEN_AUX_LAYER", 1))
     current_token_aux_decay_iters: int = int(os.environ.get("CURRENT_TOKEN_AUX_DECAY_ITERS", 0))
@@ -421,6 +423,29 @@ class MLP(nn.Module):
         return self.proj(x * x)
 
 
+class ChannelMix(nn.Module):
+    # RWKV-style local temporal mixing inside the FFN path. Attention still handles
+    # global retrieval; this module only makes the MLP time-aware.
+    def __init__(self, dim: int, mlp_mult: int, shift_init: float):
+        super().__init__()
+        hidden = dim * mlp_mult
+        self.x_k = mx.ones((dim,), dtype=mx.float32) * shift_init
+        self.x_r = mx.ones((dim,), dtype=mx.float32) * shift_init
+        self.fc = CastedLinear(dim, hidden)
+        self.gate = CastedLinear(dim, dim)
+        self.proj = CastedLinear(hidden, dim)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        xx = shift_right(x) - x
+        x_k = self.x_k.astype(x.dtype)[None, None, :]
+        x_r = self.x_r.astype(x.dtype)[None, None, :]
+        k_in = x + xx * x_k
+        r_in = x + xx * x_r
+        h = nn.relu(self.fc(k_in))
+        h = h * h
+        return sigmoid01(self.gate(r_in).astype(x.dtype)) * self.proj(h)
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -432,6 +457,8 @@ class Block(nn.Module):
         qk_gain_init: float,
         use_token_shift: bool,
         token_shift_init: float,
+        use_channel_mix: bool,
+        channel_mix_shift_init: float,
         use_dyt: bool,
         dyt_alpha_init_attn: float,
         dyt_alpha_init_ffn: float,
@@ -452,7 +479,7 @@ class Block(nn.Module):
             use_dyt,
             dyt_alpha_init_qk,
         )
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = ChannelMix(dim, mlp_mult, channel_mix_shift_init) if use_channel_mix else MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
@@ -471,11 +498,13 @@ class GPT(nn.Module):
     # - encoder half accumulates skip tensors
     # - decoder half consumes reversed skips with learned skip_weights
     # - optional K/V token shift inside attention for cheap previous-token mixing
+    # - optional ChannelMix MLP replacement for local temporal mixing in the FFN path
     # - optional Dynamic Tanh (DyT) in place of RMSNorm, with an LLM-style post-embedding scale
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
                  qk_gain_init: float, use_token_shift: bool, token_shift_init: float,
+                 use_channel_mix: bool, channel_mix_shift_init: float,
                  use_dyt: bool, dyt_alpha_init_embed: float, dyt_alpha_init_attn: float,
                  dyt_alpha_init_ffn: float, dyt_alpha_init_qk: float, dyt_embed_scale_init: float):
         super().__init__()
@@ -508,6 +537,8 @@ class GPT(nn.Module):
                 qk_gain_init,
                 use_token_shift,
                 token_shift_init,
+                use_channel_mix,
+                channel_mix_shift_init,
                 use_dyt,
                 dyt_alpha_init_attn,
                 dyt_alpha_init_ffn,
@@ -1073,6 +1104,8 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         use_token_shift=args.use_token_shift,
         token_shift_init=args.token_shift_init,
+        use_channel_mix=args.use_channel_mix,
+        channel_mix_shift_init=args.channel_mix_shift_init,
         use_dyt=args.use_dyt,
         dyt_alpha_init_embed=args.dyt_alpha_init_embed,
         dyt_alpha_init_attn=args.dyt_alpha_init_attn,
@@ -1134,6 +1167,7 @@ def main() -> None:
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
     log(f"token_shift:enabled={args.use_token_shift} init={args.token_shift_init}")
+    log(f"channel_mix:enabled={args.use_channel_mix} shift_init={args.channel_mix_shift_init}")
     if args.use_dyt:
         embed_scale_init = args.dyt_embed_scale_init if args.dyt_embed_scale_init > 0.0 else math.sqrt(args.model_dim)
         log(
