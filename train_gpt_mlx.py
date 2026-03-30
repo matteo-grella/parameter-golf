@@ -87,6 +87,12 @@ class Hyperparameters:
     current_token_aux_weight: float = float(os.environ.get("CURRENT_TOKEN_AUX_WEIGHT", 0.10))
     current_token_aux_layer: int = int(os.environ.get("CURRENT_TOKEN_AUX_LAYER", 1))
     current_token_aux_decay_iters: int = int(os.environ.get("CURRENT_TOKEN_AUX_DECAY_ITERS", 0))
+    use_dyt: bool = bool(int(os.environ.get("USE_DYT", "1")))
+    dyt_alpha_init_embed: float = float(os.environ.get("DYT_ALPHA_INIT_EMBED", 0.5))
+    dyt_alpha_init_attn: float = float(os.environ.get("DYT_ALPHA_INIT_ATTN", 1.0))
+    dyt_alpha_init_ffn: float = float(os.environ.get("DYT_ALPHA_INIT_FFN", 0.5))
+    dyt_alpha_init_qk: float = float(os.environ.get("DYT_ALPHA_INIT_QK", 1.5))
+    dyt_embed_scale_init: float = float(os.environ.get("DYT_EMBED_SCALE_INIT", 0.0))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -184,6 +190,11 @@ def accumulate_flat_grads(
 
 def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)).astype(x.dtype)
+
+
+def softplus(x: mx.array) -> mx.array:
+    x_f32 = x.astype(mx.float32)
+    return (mx.maximum(x_f32, 0.0) + mx.log1p(mx.exp(-mx.abs(x_f32)))).astype(x.dtype)
 
 
 def sigmoid01(x: mx.array) -> mx.array:
@@ -315,6 +326,22 @@ class RMSNormNoWeight(nn.Module):
         return rms_norm(x)
 
 
+class DynamicTanh(nn.Module):
+    # DyT: tanh(alpha * x) with learned affine terms. We keep alpha positive via
+    # softplus and use per-feature affine parameters.
+    def __init__(self, dim: int, alpha_init: float):
+        super().__init__()
+        alpha_init = max(alpha_init, 1e-4)
+        self.log_alpha = mx.array(math.log(math.expm1(alpha_init)), dtype=mx.float32)
+        self.weight = mx.ones((dim,), dtype=mx.float32)
+        self.bias = mx.zeros((dim,), dtype=mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        alpha = softplus(self.log_alpha).astype(x.dtype)
+        y = mx.tanh(x * alpha)
+        return y * self.weight.astype(x.dtype) + self.bias.astype(x.dtype)
+
+
 class CausalSelfAttention(nn.Module):
     # - separate q/k/v projections
     # - optional K/V token shift to cheaply inject previous-token context before attention
@@ -330,6 +357,8 @@ class CausalSelfAttention(nn.Module):
         qk_gain_init: float,
         use_token_shift: bool,
         token_shift_init: float,
+        use_dyt: bool,
+        dyt_alpha_init_qk: float,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -351,6 +380,8 @@ class CausalSelfAttention(nn.Module):
         if use_token_shift:
             self.token_shift_mix_k = mx.ones((dim,), dtype=mx.float32) * token_shift_init
             self.token_shift_mix_v = mx.ones((dim,), dtype=mx.float32) * token_shift_init
+        self.q_norm = DynamicTanh(self.head_dim, dyt_alpha_init_qk) if use_dyt else RMSNormNoWeight()
+        self.k_norm = DynamicTanh(self.head_dim, dyt_alpha_init_qk) if use_dyt else RMSNormNoWeight()
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
 
@@ -369,8 +400,8 @@ class CausalSelfAttention(nn.Module):
         k = self.c_k(xk).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.c_v(xv).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
-        k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
+        q = self.rope(self.q_norm(q).astype(COMPUTE_DTYPE))
+        k = self.rope(self.k_norm(k).astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
@@ -401,11 +432,26 @@ class Block(nn.Module):
         qk_gain_init: float,
         use_token_shift: bool,
         token_shift_init: float,
+        use_dyt: bool,
+        dyt_alpha_init_attn: float,
+        dyt_alpha_init_ffn: float,
+        dyt_alpha_init_qk: float,
     ):
         super().__init__()
-        self.attn_norm = RMSNormNoWeight()
-        self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, use_token_shift, token_shift_init)
+        norm_cls = DynamicTanh if use_dyt else RMSNormNoWeight
+        self.attn_norm = norm_cls(dim, dyt_alpha_init_attn) if use_dyt else norm_cls()
+        self.mlp_norm = norm_cls(dim, dyt_alpha_init_ffn) if use_dyt else norm_cls()
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            use_token_shift,
+            token_shift_init,
+            use_dyt,
+            dyt_alpha_init_qk,
+        )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
@@ -425,10 +471,13 @@ class GPT(nn.Module):
     # - encoder half accumulates skip tensors
     # - decoder half consumes reversed skips with learned skip_weights
     # - optional K/V token shift inside attention for cheap previous-token mixing
+    # - optional Dynamic Tanh (DyT) in place of RMSNorm, with an LLM-style post-embedding scale
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float, use_token_shift: bool, token_shift_init: float):
+                 qk_gain_init: float, use_token_shift: bool, token_shift_init: float,
+                 use_dyt: bool, dyt_alpha_init_embed: float, dyt_alpha_init_attn: float,
+                 dyt_alpha_init_ffn: float, dyt_alpha_init_qk: float, dyt_embed_scale_init: float):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -440,11 +489,32 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+        self.use_dyt = use_dyt
+        if use_dyt:
+            self.embed_norm = DynamicTanh(dim, dyt_alpha_init_embed)
+            embed_scale_init = dyt_embed_scale_init if dyt_embed_scale_init > 0.0 else math.sqrt(dim)
+            self.embed_scale = mx.array(embed_scale_init, dtype=mx.float32)
+            self.final_norm = DynamicTanh(dim, dyt_alpha_init_ffn)
+        else:
+            self.embed_norm = RMSNormNoWeight()
+            self.final_norm = RMSNormNoWeight()
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, use_token_shift, token_shift_init)
+            Block(
+                dim,
+                num_heads,
+                num_kv_heads,
+                mlp_mult,
+                rope_base,
+                qk_gain_init,
+                use_token_shift,
+                token_shift_init,
+                use_dyt,
+                dyt_alpha_init_attn,
+                dyt_alpha_init_ffn,
+                dyt_alpha_init_qk,
+            )
             for i in range(num_layers)
         ]
-        self.final_norm = RMSNormNoWeight()
 
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
@@ -460,7 +530,9 @@ class GPT(nn.Module):
     def forward_hidden(self, input_ids: mx.array, aux_layer: int | None = None) -> tuple[mx.array, mx.array | None]:
         if aux_layer is not None and not (1 <= aux_layer <= len(self.blocks)):
             raise ValueError(f"current_token_aux_layer must be in [1, {len(self.blocks)}], got {aux_layer}")
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x = self.embed_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        if self.use_dyt:
+            x = x * self.embed_scale.astype(x.dtype)
         x0 = x
         skips: list[mx.array] = []
         aux_hidden: mx.array | None = None
@@ -579,11 +651,7 @@ class SplitOptimizers:
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k != self.embed_key and (
-                k == "skip_weights"
-                or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-                or (k.startswith("blocks.") and p.ndim < 2)
-            )
+            if k != self.embed_key and k not in self.matrix_keys
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -967,6 +1035,15 @@ def main() -> None:
         raise ValueError(
             f"CURRENT_TOKEN_AUX_LAYER must be in [1, {args.num_layers}], got {args.current_token_aux_layer}"
         )
+    if args.use_dyt:
+        for name, value in (
+            ("DYT_ALPHA_INIT_EMBED", args.dyt_alpha_init_embed),
+            ("DYT_ALPHA_INIT_ATTN", args.dyt_alpha_init_attn),
+            ("DYT_ALPHA_INIT_FFN", args.dyt_alpha_init_ffn),
+            ("DYT_ALPHA_INIT_QK", args.dyt_alpha_init_qk),
+        ):
+            if value <= 0.0:
+                raise ValueError(f"{name} must be positive, got {value}")
 
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size
@@ -996,6 +1073,12 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         use_token_shift=args.use_token_shift,
         token_shift_init=args.token_shift_init,
+        use_dyt=args.use_dyt,
+        dyt_alpha_init_embed=args.dyt_alpha_init_embed,
+        dyt_alpha_init_attn=args.dyt_alpha_init_attn,
+        dyt_alpha_init_ffn=args.dyt_alpha_init_ffn,
+        dyt_alpha_init_qk=args.dyt_alpha_init_qk,
+        dyt_embed_scale_init=args.dyt_embed_scale_init,
     )
     opt = SplitOptimizers(model, args)
 
@@ -1051,6 +1134,14 @@ def main() -> None:
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
     log(f"token_shift:enabled={args.use_token_shift} init={args.token_shift_init}")
+    if args.use_dyt:
+        embed_scale_init = args.dyt_embed_scale_init if args.dyt_embed_scale_init > 0.0 else math.sqrt(args.model_dim)
+        log(
+            f"dyt:enabled embed_alpha:{args.dyt_alpha_init_embed} attn_alpha:{args.dyt_alpha_init_attn} "
+            f"ffn_alpha:{args.dyt_alpha_init_ffn} qk_alpha:{args.dyt_alpha_init_qk} embed_scale_init:{embed_scale_init}"
+        )
+    else:
+        log("dyt:disabled")
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
@@ -1077,7 +1168,8 @@ def main() -> None:
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
         f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
-        f"skip_weights:{model.skip_weights.dtype}"
+        f"skip_weights:{model.skip_weights.dtype} "
+        f"norm_weight:{model.final_norm.weight.dtype if args.use_dyt else 'none'}"
     )
 
     # ==============================================================================
