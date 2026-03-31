@@ -83,6 +83,8 @@ class Hyperparameters:
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     rope_dims: int = int(os.environ.get("ROPE_DIMS", 16))
     partial_rope_last_n: int = int(os.environ.get("PARTIAL_ROPE_LAST_N", 0))
+    xsa_last_n: int = int(os.environ.get("XSA_LAST_N", 0))
+    xsa_hard: bool = bool(int(os.environ.get("XSA_HARD", "0")))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
     use_token_shift: bool = bool(int(os.environ.get("USE_TOKEN_SHIFT", "1")))
     token_shift_init: float = float(os.environ.get("TOKEN_SHIFT_INIT", 1.386294))
@@ -359,6 +361,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         rope_dims: int,
+        use_xsa: bool,
         qk_gain_init: float,
         use_token_shift: bool,
         token_shift_init: float,
@@ -392,12 +395,23 @@ class CausalSelfAttention(nn.Module):
         self.k_norm = DynamicTanh(self.head_dim, dyt_alpha_init_qk) if use_dyt else RMSNormNoWeight()
         self.rope = nn.RoPE(self.rope_dims, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
+        self.use_xsa = use_xsa
 
     def apply_rope(self, x: mx.array) -> mx.array:
         if self.rope_dims == self.head_dim:
             return self.rope(x)
         x_rope = self.rope(x[..., : self.rope_dims])
         return mx.concatenate((x_rope, x[..., self.rope_dims :]), axis=-1)
+
+    def apply_xsa(self, y: mx.array, v: mx.array) -> mx.array:
+        bsz, num_heads, seqlen, head_dim = y.shape
+        group_size = self.num_heads // self.num_kv_heads
+        y_grouped = y.reshape(bsz, self.num_kv_heads, group_size, seqlen, head_dim)
+        v_norm = v.astype(mx.float32)
+        v_norm = v_norm * mx.rsqrt(mx.sum(v_norm * v_norm, axis=-1, keepdims=True) + 1e-6)
+        v_norm = v_norm.astype(y.dtype)[:, :, None, :, :]
+        proj = mx.sum(y_grouped * v_norm, axis=-1, keepdims=True) * v_norm
+        return (y_grouped - proj).reshape(bsz, num_heads, seqlen, head_dim)
 
     def __call__(self, x: mx.array) -> mx.array:
         bsz, seqlen, dim = x.shape
@@ -418,6 +432,8 @@ class CausalSelfAttention(nn.Module):
         k = self.apply_rope(self.k_norm(k).astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
+        if self.use_xsa:
+            y = self.apply_xsa(y, v)
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -467,6 +483,7 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         rope_dims: int,
+        use_xsa: bool,
         qk_gain_init: float,
         use_token_shift: bool,
         token_shift_init: float,
@@ -487,6 +504,7 @@ class Block(nn.Module):
             num_kv_heads,
             rope_base,
             rope_dims,
+            use_xsa,
             qk_gain_init,
             use_token_shift,
             token_shift_init,
@@ -513,10 +531,12 @@ class GPT(nn.Module):
     # - decoder half consumes reversed skips with learned skip_weights
     # - optional K/V token shift inside attention for cheap previous-token mixing
     # - optional ChannelMix MLP replacement for local temporal mixing in the FFN path
+    # - optional hard XSA on the deepest layers to bias late attention toward context
     # - optional Dynamic Tanh (DyT) in place of RMSNorm, with an LLM-style post-embedding scale
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, rope_dims: int, partial_rope_last_n: int,
+                 xsa_last_n: int, xsa_hard: bool,
                  tied_embed_init_std: float,
                  qk_gain_init: float, use_token_shift: bool, token_shift_init: float,
                  use_channel_mix: bool, channel_mix_shift_init: float,
@@ -550,6 +570,7 @@ class GPT(nn.Module):
                 mlp_mult,
                 rope_base,
                 rope_dims if partial_rope_last_n <= 0 or i >= num_layers - partial_rope_last_n else 0,
+                xsa_hard and xsa_last_n > 0 and i >= num_layers - xsa_last_n,
                 qk_gain_init,
                 use_token_shift,
                 token_shift_init,
@@ -1118,6 +1139,8 @@ def main() -> None:
         rope_base=args.rope_base,
         rope_dims=args.rope_dims,
         partial_rope_last_n=args.partial_rope_last_n,
+        xsa_last_n=args.xsa_last_n,
+        xsa_hard=args.xsa_hard,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
         use_token_shift=args.use_token_shift,
@@ -1188,6 +1211,7 @@ def main() -> None:
     rope_dims = head_dim if args.rope_dims <= 0 else args.rope_dims
     log(
         f"rope:base={args.rope_base} dims={rope_dims}/{head_dim} partial_last_n={args.partial_rope_last_n} "
+        f"xsa_last_n={args.xsa_last_n} xsa_hard={args.xsa_hard} "
         f"token_shift:enabled={args.use_token_shift} init={args.token_shift_init}"
     )
     log(f"channel_mix:enabled={args.use_channel_mix} shift_init={args.channel_mix_shift_init}")
