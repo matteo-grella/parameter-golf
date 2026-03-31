@@ -85,6 +85,12 @@ class Hyperparameters:
     partial_rope_last_n: int = int(os.environ.get("PARTIAL_ROPE_LAST_N", 0))
     xsa_last_n: int = int(os.environ.get("XSA_LAST_N", 0))
     xsa_hard: bool = bool(int(os.environ.get("XSA_HARD", "0")))
+    use_curious_shards: bool = bool(int(os.environ.get("USE_CURIOUS_SHARDS", "1")))
+    curious_explore_prob: float = float(os.environ.get("CURIOUS_EXPLORE_PROB", 0.1))
+    curious_progress_decay: float = float(os.environ.get("CURIOUS_PROGRESS_DECAY", 0.9))
+    curious_region_tokens: int = int(os.environ.get("CURIOUS_REGION_TOKENS", 8_192))
+    curious_probe_tokens: int = int(os.environ.get("CURIOUS_PROBE_TOKENS", 2_048))
+    curious_probe_every: int = int(os.environ.get("CURIOUS_PROBE_EVERY", 1))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
     use_token_shift: bool = bool(int(os.environ.get("USE_TOKEN_SHIFT", "1")))
     token_shift_init: float = float(os.environ.get("TOKEN_SHIFT_INIT", 1.386294))
@@ -251,13 +257,17 @@ def load_data_shard(path: Path) -> np.ndarray:
 # TOKEN STREAMING / BATCHING
 # ==============================================================================
 
-
 class TokenStream:
     def __init__(
         self,
         pattern: str,
         log_fn: Callable[[str], None] | None = None,
         dataset_name: str = "",
+        use_curious_shards: bool = False,
+        curious_explore_prob: float = 0.1,
+        curious_progress_decay: float = 0.9,
+        curious_region_tokens: int = 65_536,
+        seed: int = 0,
     ):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
@@ -268,6 +278,48 @@ class TokenStream:
         self.dataset_name = dataset_name
         self.tokens = load_data_shard(self.files[0])
         self.pos = 0
+        self.use_curious_shards = use_curious_shards
+        self.curious_explore_prob = curious_explore_prob
+        self.curious_progress_decay = curious_progress_decay
+        self.curious_region_tokens = curious_region_tokens
+        self.rng = np.random.default_rng(seed)
+        self.loss_ema: dict[tuple[int, int], float] = {}
+        self.progress_ema: dict[tuple[int, int], float] = {}
+        self.probe_cursor: dict[int, int] = {}
+
+    def region_count(self) -> int:
+        return (self.tokens.size - 1) // max(self.curious_region_tokens, 1) + 1
+
+    def observe_probe_loss(self, file_idx: int, region_idx: int, loss: float) -> None:
+        if not self.use_curious_shards:
+            return
+        key = (file_idx, region_idx)
+        prev = self.loss_ema.get(key)
+        if prev is not None:
+            progress = max(prev - loss, 0.0)
+            self.progress_ema[key] = self.curious_progress_decay * self.progress_ema.get(key, 0.0) + (1.0 - self.curious_progress_decay) * progress
+        self.loss_ema[key] = loss if prev is None else self.curious_progress_decay * prev + (1.0 - self.curious_progress_decay) * loss
+
+    def next_probe_region(self) -> int:
+        total = self.region_count()
+        region_idx = self.probe_cursor.get(self.file_idx, 0) % total
+        self.probe_cursor[self.file_idx] = region_idx + 1
+        return region_idx
+
+    def choose_next_region(self) -> int:
+        cur = self.pos // self.curious_region_tokens
+        total = self.region_count()
+        if not self.use_curious_shards or self.curious_region_tokens <= 0 or self.tokens.size <= self.curious_region_tokens:
+            return cur
+        if not any(j == self.file_idx for j, _ in self.loss_ema):
+            return cur
+        if self.rng.random() < self.curious_explore_prob:
+            return (cur + 1) % total
+        best = max(((self.progress_ema.get((self.file_idx, r), 0.0), r) for r in range(total)), default=(0.0, cur))
+        return best[1] if best[0] > 0.0 else (cur + 1) % total
+
+    def set_region(self, region_idx: int) -> None:
+        self.pos = min(region_idx * self.curious_region_tokens, max(self.tokens.size - 1, 0))
 
     def next_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
@@ -278,9 +330,7 @@ class TokenStream:
                     f"WARNING: starting epoch:{self.epoch} "
                     f"dataset:{self.dataset_name} train_shards:{len(self.files)}"
                 )
-        self.tokens = load_data_shard(self.files[self.file_idx])
-        self.pos = 0
-
+        self.tokens = load_data_shard(self.files[self.file_idx]); self.pos = 0
     def take(self, n: int) -> np.ndarray:
         chunks: list[np.ndarray] = []
         left = n
@@ -292,26 +342,48 @@ class TokenStream:
             self.pos += k
             left -= k
         return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
-
-
 class TokenLoader:
     def __init__(
         self,
         pattern: str,
         log_fn: Callable[[str], None] | None = None,
         dataset_name: str = "",
+        args: Hyperparameters | None = None,
     ):
-        self.stream = TokenStream(pattern, log_fn=log_fn, dataset_name=dataset_name)
+        self.stream = TokenStream(
+            pattern,
+            log_fn=log_fn,
+            dataset_name=dataset_name,
+            use_curious_shards=args.use_curious_shards if args is not None else False,
+            curious_explore_prob=args.curious_explore_prob if args is not None else 0.1,
+            curious_progress_decay=args.curious_progress_decay if args is not None else 0.9,
+            curious_region_tokens=args.curious_region_tokens if args is not None else 65_536,
+            seed=args.seed if args is not None else 0,
+        )
 
     def next_batch(self, batch_tokens: int, seq_len: int) -> tuple[mx.array, mx.array]:
         usable = (batch_tokens // seq_len) * seq_len
         if usable <= 0:
             raise ValueError(f"token budget too small for seq_len={seq_len}")
+        if self.stream.use_curious_shards:
+            self.stream.set_region(self.stream.choose_next_region())
         chunk = self.stream.take(usable + 1)
         x = chunk[:-1].reshape(-1, seq_len)
         y = chunk[1:].reshape(-1, seq_len)
         return mx.array(x, dtype=mx.int32), mx.array(y, dtype=mx.int32)
 
+    def maybe_refresh_progress(self, args: Hyperparameters, compiled_loss, step: int) -> None:
+        if not args.use_curious_shards or args.curious_probe_every <= 0 or (step + 1) % args.curious_probe_every:
+            return
+        region_idx = self.stream.next_probe_region()
+        region_start = region_idx * max(args.curious_region_tokens, 1)
+        usable = (min(args.curious_probe_tokens, args.curious_region_tokens) // args.train_seq_len) * args.train_seq_len
+        if usable <= 0 or region_start + usable >= self.stream.tokens.size:
+            return
+        chunk = self.stream.tokens[region_start : region_start + usable + 1]
+        loss = compiled_loss(mx.array(chunk[:-1].reshape(-1, args.train_seq_len), dtype=mx.int32), mx.array(chunk[1:].reshape(-1, args.train_seq_len), dtype=mx.int32)).astype(mx.float32)
+        mx.eval(loss)
+        self.stream.observe_probe_loss(self.stream.file_idx, region_idx, float(loss.item()))
 
 # ==============================================================================
 # MODEL BLOCKS
@@ -1122,7 +1194,7 @@ def main() -> None:
     # ==============================================================================
     mx.random.seed(args.seed)
 
-    train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+    train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name, args=args)
 
     # ==============================================================================
     # MODEL + OPTIMIZER SETUP
@@ -1230,6 +1302,13 @@ def main() -> None:
         f"warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log(f"mlx_max_microbatch_tokens:{args.mlx_max_microbatch_tokens}")
+    if args.use_curious_shards:
+        log(
+            f"curious_shards:enabled explore_prob:{args.curious_explore_prob} progress_decay:{args.curious_progress_decay} "
+            f"region_tokens:{args.curious_region_tokens} probe_tokens:{args.curious_probe_tokens} probe_every:{args.curious_probe_every}"
+        )
+    else:
+        log("curious_shards:disabled")
     log(
         f"optimizer:muon+adam muon_matrix_params:{len(opt.matrix_keys)} scalar_params:{len(opt.scalar_keys)} "
         f"embed_lr:{args.tied_embed_lr} "
@@ -1295,7 +1374,7 @@ def main() -> None:
         mx.eval(warm_val_loss)
         mx.synchronize()
 
-        train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+        train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name, args=args)
 
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
@@ -1352,6 +1431,7 @@ def main() -> None:
         grads = clip_grad_tree(grads, args.grad_clip_norm)
         train_loss_value = float(train_loss.item())
         opt.step(model, grads, step=step, lr_mul=lr_mul)
+        train_loader.maybe_refresh_progress(args, compiled_loss, step)
         mx.synchronize()
 
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
