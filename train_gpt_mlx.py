@@ -81,6 +81,8 @@ class Hyperparameters:
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_dims: int = int(os.environ.get("ROPE_DIMS", 16))
+    partial_rope_last_n: int = int(os.environ.get("PARTIAL_ROPE_LAST_N", 0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
     use_token_shift: bool = bool(int(os.environ.get("USE_TOKEN_SHIFT", "1")))
     token_shift_init: float = float(os.environ.get("TOKEN_SHIFT_INIT", 1.386294))
@@ -356,6 +358,7 @@ class CausalSelfAttention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         rope_base: float,
+        rope_dims: int,
         qk_gain_init: float,
         use_token_shift: bool,
         token_shift_init: float,
@@ -372,6 +375,9 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        self.rope_dims = self.head_dim if rope_dims <= 0 else rope_dims
+        if self.rope_dims > self.head_dim or self.rope_dims % 2 != 0:
+            raise ValueError(f"rope_dims must be even and <= head_dim ({self.head_dim}), got {self.rope_dims}")
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, kv_dim)
@@ -384,8 +390,14 @@ class CausalSelfAttention(nn.Module):
             self.token_shift_mix_v = mx.ones((dim,), dtype=mx.float32) * token_shift_init
         self.q_norm = DynamicTanh(self.head_dim, dyt_alpha_init_qk) if use_dyt else RMSNormNoWeight()
         self.k_norm = DynamicTanh(self.head_dim, dyt_alpha_init_qk) if use_dyt else RMSNormNoWeight()
-        self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
+        self.rope = nn.RoPE(self.rope_dims, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
+
+    def apply_rope(self, x: mx.array) -> mx.array:
+        if self.rope_dims == self.head_dim:
+            return self.rope(x)
+        x_rope = self.rope(x[..., : self.rope_dims])
+        return mx.concatenate((x_rope, x[..., self.rope_dims :]), axis=-1)
 
     def __call__(self, x: mx.array) -> mx.array:
         bsz, seqlen, dim = x.shape
@@ -402,8 +414,8 @@ class CausalSelfAttention(nn.Module):
         k = self.c_k(xk).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.c_v(xv).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        q = self.rope(self.q_norm(q).astype(COMPUTE_DTYPE))
-        k = self.rope(self.k_norm(k).astype(COMPUTE_DTYPE))
+        q = self.apply_rope(self.q_norm(q).astype(COMPUTE_DTYPE))
+        k = self.apply_rope(self.k_norm(k).astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
@@ -454,6 +466,7 @@ class Block(nn.Module):
         num_kv_heads: int,
         mlp_mult: int,
         rope_base: float,
+        rope_dims: int,
         qk_gain_init: float,
         use_token_shift: bool,
         token_shift_init: float,
@@ -473,6 +486,7 @@ class Block(nn.Module):
             num_heads,
             num_kv_heads,
             rope_base,
+            rope_dims,
             qk_gain_init,
             use_token_shift,
             token_shift_init,
@@ -502,7 +516,8 @@ class GPT(nn.Module):
     # - optional Dynamic Tanh (DyT) in place of RMSNorm, with an LLM-style post-embedding scale
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
+                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, rope_dims: int, partial_rope_last_n: int,
+                 tied_embed_init_std: float,
                  qk_gain_init: float, use_token_shift: bool, token_shift_init: float,
                  use_channel_mix: bool, channel_mix_shift_init: float,
                  use_dyt: bool, dyt_alpha_init_embed: float, dyt_alpha_init_attn: float,
@@ -534,6 +549,7 @@ class GPT(nn.Module):
                 num_kv_heads,
                 mlp_mult,
                 rope_base,
+                rope_dims if partial_rope_last_n <= 0 or i >= num_layers - partial_rope_last_n else 0,
                 qk_gain_init,
                 use_token_shift,
                 token_shift_init,
@@ -1100,6 +1116,8 @@ def main() -> None:
         logit_chunk_tokens=args.logit_chunk_tokens,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
+        rope_dims=args.rope_dims,
+        partial_rope_last_n=args.partial_rope_last_n,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
         use_token_shift=args.use_token_shift,
@@ -1166,7 +1184,12 @@ def main() -> None:
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
-    log(f"token_shift:enabled={args.use_token_shift} init={args.token_shift_init}")
+    head_dim = args.model_dim // args.num_heads
+    rope_dims = head_dim if args.rope_dims <= 0 else args.rope_dims
+    log(
+        f"rope:base={args.rope_base} dims={rope_dims}/{head_dim} partial_last_n={args.partial_rope_last_n} "
+        f"token_shift:enabled={args.use_token_shift} init={args.token_shift_init}"
+    )
     log(f"channel_mix:enabled={args.use_channel_mix} shift_init={args.channel_mix_shift_init}")
     if args.use_dyt:
         embed_scale_init = args.dyt_embed_scale_init if args.dyt_embed_scale_init > 0.0 else math.sqrt(args.model_dim)
